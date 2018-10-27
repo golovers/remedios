@@ -1,14 +1,17 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
-	"reflect"
 	"strings"
-	"sync/atomic"
+	"sync"
+
+	"crypto/md5"
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/sirupsen/logrus"
@@ -21,50 +24,52 @@ func main() {
 	flag.Parse()
 
 	ch := loadConf(*pth)
-	conf := atomic.Value{}
+	endponts := sync.Map{}
 	go func() {
 		for {
 			select {
 			case c := <-ch:
-				conf.Store(c)
+				endponts.Range(func(k, v interface{}) bool {
+					endponts.Delete(k)
+					return true
+				})
+				for _, e := range c.Endpoints {
+					cases := make(map[string]kase)
+					for _, c := range e.Cases {
+						if c.Response.Status <= 0 {
+							c.Response.Status = http.StatusOK
+						}
+						cases[hashit(c.Request.Body)] = c
+					}
+					endponts.Store(key(e.Method, e.Path), cases)
+				}
 			}
 		}
 	}()
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		logrus.Infof("%s - %s\n", r.Method, r.URL.Path)
-		var v interface{}
-		if err := json.NewDecoder(r.Body).Decode(&v); err != nil && err != io.EOF {
-			logrus.Errorf("parsing json the request failed: %v\n", err)
+		ev, ok := endponts.Load(key(r.Method, r.URL.Path))
+		notfound := func() {
+			w.WriteHeader(http.StatusNotFound)
+			w.Write([]byte("not found"))
+			return
 		}
-		defer r.Body.Close()
-		c := conf.Load().(*config)
-		for _, e := range c.Endpoints {
-			if e.Method == "" {
-				e.Method = "get"
-			}
-			if e.Path == r.URL.Path && strings.ToLower(e.Method) == strings.ToLower(r.Method) {
-				for _, c := range e.Cases {
-					if reflect.DeepEqual(v, c.Request.Body) {
-						if c.Response.Status == 0 {
-							c.Response.Status = http.StatusOK
-						}
-						w.WriteHeader(c.Response.Status)
-						v, err := json.Marshal(c.Response.Body)
-						if err != nil {
-							panic(err) // panic so that the owner update the config accordingly
-						}
-						w.Write(v)
-						return
-					}
-				}
-
-			}
+		if !ok {
+			notfound()
+			return
 		}
-
-		// not found
-		w.WriteHeader(http.StatusNotFound)
-		w.Write([]byte("not found"))
+		c, ok := (ev.(map[string]kase))[hashit(r.Body)]
+		if !ok {
+			notfound()
+			return
+		}
+		w.WriteHeader(c.Response.Status)
+		v, err := json.Marshal(c.Response.Body)
+		if err != nil {
+			panic(err) // panic so that the owner update the config accordingly
+		}
+		w.Write(v)
 	})
 	if err := http.ListenAndServe(":"+*p, nil); err != nil {
 		log.Fatalf("http: listen error: %v\n", err)
@@ -75,26 +80,27 @@ type config struct {
 	Endpoints []struct {
 		Path   string
 		Method string
-		Cases  []struct {
-			Request struct {
-				Header map[string]string
-				Body   interface{}
-			}
-			Response struct {
-				Status int
-				Body   interface{}
-			}
-		}
+		Cases  []kase
+	}
+}
+
+type kase struct {
+	Request struct {
+		Header map[string]string
+		Body   interface{}
+	}
+	Response struct {
+		Status int
+		Body   interface{}
 	}
 }
 
 func loadConf(path string) <-chan *config {
 	ch := make(chan *config, 1)
 	v := viper.New()
-	name := "remedios"
 	v.SetConfigType("json")
 	v.AddConfigPath(path)
-	v.SetConfigName(name)
+	v.SetConfigName("remedios")
 
 	if err := v.ReadInConfig(); err != nil {
 		panic(err)
@@ -118,4 +124,32 @@ func loadConf(path string) <-chan *config {
 		}
 	})
 	return ch
+}
+
+func key(method, path string) string {
+	return fmt.Sprintf("%s-%s", strings.ToLower(method), strings.ToLower(path))
+}
+
+func hashit(v interface{}) string {
+	if v == nil {
+		return ""
+	}
+	h := func(v interface{}) string {
+		h := md5.New()
+		b, err := json.Marshal(v)
+		if err != nil {
+			return ""
+		}
+		h.Write(b)
+		return base64.StdEncoding.EncodeToString(h.Sum(nil))
+	}
+	if rc, ok := v.(io.ReadCloser); ok {
+		var val interface{}
+		// need to do this to make sure both keys use the same encoding & decoding
+		if err := json.NewDecoder(rc).Decode(&val); err != nil {
+			return ""
+		}
+		return h(val)
+	}
+	return h(v)
 }
